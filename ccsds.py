@@ -1,24 +1,107 @@
-﻿"""
-KAVACH CCSDS Space Packet & Cryptographic Engine v3.0
-- CCSDS 133.0-B Primary Header Framing
-- HKDF-SHA256 Key Derivation (NIST SP 800-56C)
-- 64-Frame Sliding Anti-Replay Window Filter
-"""
-import struct
+﻿import struct
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 
-APID_TELEMETRY = 0x100
-APID_TELECOMMAND = 0x200
-APID_HANDSHAKE = 0x001
+def derive_session_keys(shared_secret: bytes, salt: bytes = None):
+    """
+    NIST SP 800-56C HKDF-SHA256 Key Derivation.
+    Derives 32-byte AES-256 key and 32-byte MAC key from ML-KEM shared secret.
+    """
+    if salt is None:
+        salt = b"\x00" * 32
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=salt,
+        info=b"KAVACH-LEO-SPACECRAFT-PROTOCOL-V1",
+    )
+    key_material = hkdf.derive(shared_secret)
+    k_enc = key_material[:32]
+    k_mac = key_material[32:64]
+    return k_enc, k_mac
+
+def pack_ccsds_header(apid: int, seq_count: int, payload_len: int, packet_type: int = 0) -> bytes:
+    """Packs a 6-byte CCSDS 133.0-B Primary Header."""
+    version = 0
+    sec_hdr_flag = 0
+    word0 = ((version & 0x07) << 13) | ((packet_type & 0x01) << 12) | ((sec_hdr_flag & 0x01) << 11) | (apid & 0x07FF)
+    seq_flags = 3
+    word1 = ((seq_flags & 0x03) << 14) | (seq_count & 0x3FFF)
+    word2 = max(0, payload_len - 1) & 0xFFFF
+    return struct.pack(">HHH", word0, word1, word2)
+
+pack_primary_header = pack_ccsds_header
+
+def unpack_ccsds_header(data: bytes) -> tuple:
+    """Unpacks a 6-byte CCSDS 133.0-B Primary Header."""
+    if len(data) < 6:
+        raise ValueError("Data too short for CCSDS Primary Header")
+        
+    word0, word1, word2 = struct.unpack(">HHH", data[:6])
+    version = (word0 >> 13) & 0x07
+    packet_type = (word0 >> 12) & 0x01
+    sec_hdr_flag = (word0 >> 11) & 0x01
+    apid = word0 & 0x07FF
+    seq_flags = (word1 >> 14) & 0x03
+    seq_count = word1 & 0x3FFF
+    payload_len = word2 + 1
+    
+    hdr_dict = {
+        "version": version,
+        "type": packet_type,
+        "sec_hdr_flag": sec_hdr_flag,
+        "apid": apid,
+        "seq_flags": seq_flags,
+        "seq": seq_count,
+        "len": payload_len
+    }
+    return hdr_dict, data[6:]
+
+unpack_primary_header = unpack_ccsds_header
+
+def make_telemetry_frame(seq: int, payload: bytes, apid: int = 0x100) -> bytes:
+    """Helper to construct a complete CCSDS Telemetry frame."""
+    hdr = pack_ccsds_header(apid=apid, seq_count=seq, payload_len=len(payload), packet_type=0)
+    return hdr + payload
+
+class CCSDSPacket:
+    """CCSDS 133.0-B Space Packet wrapper class."""
+    def __init__(self, apid: int, seq_count: int, payload: bytes, packet_type: int = 0):
+        self.apid = apid
+        self.seq_count = seq_count
+        self.payload = payload
+        self.packet_type = packet_type
+
+    def pack(self) -> bytes:
+        hdr = pack_ccsds_header(self.apid, self.seq_count, len(self.payload), self.packet_type)
+        return hdr + self.payload
+
+    def __getitem__(self, key):
+        if key == "apid":
+            return self.apid
+        elif key in ("seq", "seq_count"):
+            return self.seq_count
+        elif key in ("payload", "data"):
+            return self.payload
+        elif key in ("type", "packet_type"):
+            return self.packet_type
+        elif key in ("len", "length"):
+            return len(self.payload)
+        raise KeyError(f"Invalid key: {key}")
+
+    @classmethod
+    def unpack(cls, data: bytes):
+        hdr, payload = unpack_ccsds_header(data)
+        return cls(apid=hdr["apid"], seq_count=hdr["seq"], payload=payload, packet_type=hdr["type"])
 
 class AntiReplayWindow:
+    """64-frame sliding bitmap anti-replay window filter for CCSDS sequence counts."""
     def __init__(self, window_size: int = 64):
         self.window_size = window_size
         self.max_seq = -1
         self.bitmap = 0
 
-    def validate_and_update(self, seq: int) -> bool:
+    def is_valid(self, seq: int) -> bool:
         if self.max_seq == -1:
             self.max_seq = seq
             self.bitmap = 1
@@ -26,78 +109,26 @@ class AntiReplayWindow:
 
         if seq > self.max_seq:
             diff = seq - self.max_seq
-            if diff < self.window_size:
-                self.bitmap = (self.bitmap << diff) | 1
-            else:
+            if diff >= self.window_size:
                 self.bitmap = 1
+            else:
+                self.bitmap = (self.bitmap << diff) & ((1 << self.window_size) - 1)
+                self.bitmap |= 1
             self.max_seq = seq
             return True
 
         diff = self.max_seq - seq
         if diff >= self.window_size:
-            return False  # Replayed packet is too old
+            return False
 
-        if (self.bitmap & (1 << diff)) != 0:
-            return False  # Already received (Replay Attack)
+        if (self.bitmap >> diff) & 1:
+            return False
 
         self.bitmap |= (1 << diff)
         return True
 
-def derive_session_keys(shared_secret: bytes) -> tuple[bytes, bytes]:
-    """Derives separate Payload Key (32B) and MAC Key (32B) using HKDF-SHA256"""
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=64,
-        salt=b"KAVACH-LEO-SALT-V1",
-        info=b"KAVACH-HKDF-SPACE-LINK",
-    )
-    derived = hkdf.derive(shared_secret)
-    return derived[:32], derived[32:]
+    def validate(self, seq: int) -> bool:
+        return self.is_valid(seq)
 
-class CCSDSPacket:
-    def __init__(self, apid: int, seq_count: int, data: bytes, is_telecommand: bool = False):
-        self.version = 0
-        self.type = 1 if is_telecommand else 0
-        self.sec_header_flag = 0
-        self.apid = apid & 0x7FF
-        self.seq_flags = 0b11
-        self.seq_count = seq_count & 0x3FFF
-        self.data = data
-
-    def pack(self) -> bytes:
-        word0 = ((self.version & 0x7) << 13) | ((self.type & 0x1) << 12) | ((self.sec_header_flag & 0x1) << 11) | (self.apid & 0x7FF)
-        word1 = ((self.seq_flags & 0x3) << 14) | (self.seq_count & 0x3FFF)
-        length = max(len(self.data) - 1, 0) & 0xFFFF
-        header = struct.pack(">HHH", word0, word1, length)
-        return header + self.data
-
-    @staticmethod
-    def unpack(raw: bytes):
-        if len(raw) < 6:
-            raise ValueError("CCSDS frame too short")
-        word0, word1, length = struct.unpack(">HHH", raw[:6])
-        version = (word0 >> 13) & 0x7
-        pkt_type = (word0 >> 12) & 0x1
-        apid = word0 & 0x7FF
-        seq_flags = (word1 >> 14) & 0x3
-        seq_count = word1 & 0x3FFF
-        data = raw[6:6 + length + 1]
-        return {
-            "version": version,
-            "type": "TC" if pkt_type else "TM",
-            "apid": apid,
-            "seq_count": seq_count,
-            "seq_flags": seq_flags,
-            "length": length + 1,
-            "data": data,
-            "raw_header": raw[:6],
-        }
-
-def make_telemetry_frame(seq: int, payload: bytes) -> bytes:
-    return CCSDSPacket(APID_TELEMETRY, seq, payload, is_telecommand=False).pack()
-
-def make_telecommand_frame(seq: int, payload: bytes) -> bytes:
-    return CCSDSPacket(APID_TELECOMMAND, seq, payload, is_telecommand=True).pack()
-
-def make_handshake_frame(seq: int, payload: bytes) -> bytes:
-    return CCSDSPacket(APID_HANDSHAKE, seq, payload, is_telecommand=False).pack()
+    def validate_and_update(self, seq: int) -> bool:
+        return self.is_valid(seq)

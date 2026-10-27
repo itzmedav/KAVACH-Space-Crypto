@@ -5,7 +5,7 @@ import json
 import time
 import pandas as pd
 from ccsds import derive_session_keys, pack_ccsds_header, unpack_ccsds_header
-from rf_channel import calculate_rf_metrics, corrupt_payload
+from rf_channel import corrupt_payload
 from oqs import KeyEncapsulation
 
 st.set_page_config(
@@ -60,17 +60,17 @@ st.sidebar.markdown("---")
 
 st.sidebar.markdown("### 📡 Encrypted Telecommand Dispatch")
 col_c1, col_c2 = st.sidebar.columns(2)
-cmd_safe = col_c1.button("🔴 SAFE MODE", help="Transmit PQC command to place satellite in SAFE MODE")
-cmd_nom = col_c2.button("🟢 NOMINAL", help="Transmit PQC command to restore NOMINAL MODE")
+cmd_safe = col_c1.button("🔴 SAFE MODE")
+cmd_nom = col_c2.button("🟢 NOMINAL")
 
 col_c3, col_c4 = st.sidebar.columns(2)
-cmd_ecl = col_c3.button("🌑 ECLIPSE", help="Simulate Earth Shadow Eclipse")
-cmd_det = col_c4.button("🌀 DETUMBLE", help="Fire B-dot magnetorquers to stabilize rotation")
+cmd_ecl = col_c3.button("🌑 ECLIPSE")
+cmd_det = col_c4.button("🌀 DETUMBLE")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚔️ Cyber Attack Harness")
-inject_replay = st.sidebar.button("⚡ INJECT REPLAY ATTACK", help="Re-sends an old valid CCSDS frame to test sequence rejection")
-inject_tamper = st.sidebar.button("💥 INJECT BIT-FLIP TAMPERING", help="Flips payload bits to test AES-GCM AEAD tag failure")
+inject_replay = st.sidebar.button("⚡ INJECT REPLAY ATTACK")
+inject_tamper = st.sidebar.button("💥 INJECT BIT-FLIP TAMPERING")
 
 def dispatch_telecommand(command_str=None, attack_mode=None):
     try:
@@ -78,7 +78,6 @@ def dispatch_telecommand(command_str=None, attack_mode=None):
         s.settimeout(2.0)
         s.connect(('127.0.0.1', 9999))
         
-        # 1. ML-KEM-768 Handshake
         raw_pk = s.recv(2048)
         if not raw_pk:
             s.close()
@@ -88,9 +87,8 @@ def dispatch_telecommand(command_str=None, attack_mode=None):
             ciphertext, shared_secret = client_kem.encap_secret(raw_pk)
             
         s.sendall(ciphertext)
-        k_enc, _, _ = derive_session_keys(shared_secret)
+        k_enc, _ = derive_session_keys(shared_secret)
         
-        # 2. Receive Encrypted Telemetry Downlink
         frame = s.recv(4096)
         hdr, payload = unpack_ccsds_header(frame)
         
@@ -105,7 +103,6 @@ def dispatch_telecommand(command_str=None, attack_mode=None):
         except Exception as e:
             telemetry = {"error": f"Decryption failed: {e}"}
 
-        # 3. Transmit Authenticated Telecommand Uplink
         if command_str:
             cmd_payload = json.dumps({"cmd": command_str, "timestamp": time.time()}).encode('utf-8')
             seq = st.session_state.seq_count
@@ -134,7 +131,6 @@ def dispatch_telecommand(command_str=None, attack_mode=None):
     except Exception:
         return None, None
 
-# Command Action Router
 pending_cmd = None
 if cmd_safe: pending_cmd = "CMD_SAFE_MODE"
 elif cmd_nom: pending_cmd = "CMD_NOMINAL"
