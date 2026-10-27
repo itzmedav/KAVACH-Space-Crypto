@@ -1,10 +1,11 @@
 ﻿"""
-KAVACH Spacecraft Flight Software v3.0
-- NIST FIPS 203 ML-KEM-768 Key Encapsulation
-- NIST SP 800-56C HKDF-SHA256 Key Derivation
-- AES-256-GCM Payload Encryption
+KAVACH Spacecraft Flight Software v3.2 (Auto-Reconnect Resilience)
+- NIST FIPS 203 ML-KEM-768
+- NIST SP 800-56C HKDF-SHA256
+- AES-256-GCM
 - CCSDS 133.0-B Framing + 64-Frame Anti-Replay Filter
-- Real-Time LEO Orbital Trajectory Dynamics (Lat/Lon/Alt/Eclipse)
+- Real-Time LEO Orbital Trajectory Dynamics
+- Resilient Auto-Reconnect Server Loop
 """
 import socket
 import json
@@ -23,8 +24,8 @@ PORT = 9999
 class LEOSpacecraft:
     def __init__(self):
         self.altitude_km = 420.0
-        self.period_s = 5570.0  # ~92.8 minutes per orbit
-        self.inclination_deg = 51.6  # ISS Orbit Inclination
+        self.period_s = 5570.0
+        self.inclination_deg = 51.6
         self.velocity_kms = 7.66
         self.battery_v = 28.4
         self.battery_temp_c = 22.0
@@ -41,12 +42,10 @@ class LEOSpacecraft:
 
     def step(self):
         t = time.time() - self.t0
-        phase = (t % self.period_s) / self.period_s  # 0.0 to 1.0
+        phase = (t % self.period_s) / self.period_s
 
-        # Orbital Position Calculations
         orbit_angle = phase * 2.0 * math.pi
         self.lat = self.inclination_deg * math.sin(orbit_angle)
-        # Account for Earth rotation (~15 deg/hr)
         earth_rotation = (t / 86400.0) * 360.0
         self.lon = ((phase * 360.0 - earth_rotation + 180.0) % 360.0) - 180.0
 
@@ -103,7 +102,7 @@ def aes_decrypt(key: bytes, blob: bytes) -> bytes:
 
 def main():
     print("=" * 65)
-    print("  KAVACH SPACECRAFT FLIGHT SOFTWARE v3.0")
+    print("  KAVACH SPACECRAFT FLIGHT SOFTWARE v3.2 (RESILIENT)")
     print("  Post-Quantum Engine : ML-KEM-768 (NIST FIPS 203)")
     print("  Key Derivation      : HKDF-SHA256 (NIST SP 800-56C)")
     print("  Anti-Replay Filter  : 64-Frame Sliding Window")
@@ -111,94 +110,91 @@ def main():
     print("=" * 65)
 
     sc = LEOSpacecraft()
-    replay_filter = AntiReplayWindow(window_size=64)
-    kem = oqs.KeyEncapsulation("ML-KEM-768")
-    public_key = kem.generate_keypair()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
-    srv.listen(1)
-    print(f"[SAT] Waiting for ground station on port {PORT}...")
+    srv.listen(5)
 
-    conn, addr = srv.accept()
-    print(f"[SAT] Ground station connected: {addr}")
+    # Master server loop - Never crashes on client disconnect!
+    while True:
+        print(f"\n[SAT] Listening for Ground Station on port {PORT}...")
+        try:
+            conn, addr = srv.accept()
+            print(f"[SAT] Ground Station connected: {addr}")
 
-    hs_frame = make_handshake_frame(0, public_key)
-    conn.sendall(struct.pack(">I", len(hs_frame)) + hs_frame)
-    print("[SAT] Sent ML-KEM-768 public key (CCSDS APID=0x001)")
+            replay_filter = AntiReplayWindow(window_size=64)
+            kem = oqs.KeyEncapsulation("ML-KEM-768")
+            public_key = kem.generate_keypair()
 
-    raw_len = conn.recv(4)
-    if len(raw_len) < 4:
-        print("[SAT] Handshake failed")
-        return
-    n = struct.unpack(">I", raw_len)[0]
-    encap_blob = b""
-    while len(encap_blob) < n:
-        encap_blob += conn.recv(n - len(encap_blob))
+            hs_frame = make_handshake_frame(0, public_key)
+            conn.sendall(struct.pack(">I", len(hs_frame)) + hs_frame)
 
-    try:
-        parsed = CCSDSPacket.unpack(encap_blob)
-        ciphertext = parsed["data"]
-    except Exception:
-        ciphertext = encap_blob
+            raw_len = conn.recv(4)
+            if len(raw_len) < 4:
+                conn.close()
+                continue
 
-    shared_secret = kem.decap_secret(ciphertext)
-    payload_key, mac_key = derive_session_keys(shared_secret)
-    print("[SAT] Derived session keys using HKDF-SHA256 (AES-256 Key Ready)")
-    print("[SAT] Entering nominal LEO operations...\n")
+            n = struct.unpack(">I", raw_len)[0]
+            encap_blob = b""
+            while len(encap_blob) < n:
+                encap_blob += conn.recv(n - len(encap_blob))
 
-    seq = 1
-    try:
-        while True:
-            tlm = sc.telemetry_dict()
-            tlm_json = json.dumps(tlm).encode("utf-8")
-            encrypted = aes_encrypt(payload_key, tlm_json)
-            frame = make_telemetry_frame(seq, encrypted)
-            seq = (seq + 1) % 16384
-            conn.sendall(struct.pack(">I", len(frame)) + frame)
-
-            eclipse_str = "ECLIPSE" if tlm["in_eclipse"] else "SUNLIGHT"
-            print(
-                f"[TM] seq={tlm['ccsds_seq']:04d} | lat={tlm['latitude']}° lon={tlm['longitude']}° | "
-                f"h={tlm['altitude_km']} km | bat={tlm['battery_v']} V | {eclipse_str}"
-            )
-
-            conn.settimeout(0.3)
             try:
-                hdr = conn.recv(4)
-                if hdr and len(hdr) == 4:
-                    clen = struct.unpack(">I", hdr)[0]
-                    cdata = b""
-                    while len(cdata) < clen:
-                        cdata += conn.recv(clen - len(cdata))
-                    try:
-                        cparsed = CCSDSPacket.unpack(cdata)
-                        cseq = cparsed["seq_count"]
+                parsed = CCSDSPacket.unpack(encap_blob)
+                ciphertext = parsed["data"]
+            except Exception:
+                ciphertext = encap_blob
 
-                        if not replay_filter.validate_and_update(cseq):
-                            print(f"[SECURITY ALERT] REPLAY ATTACK REJECTED! (Frame seq={cseq})")
-                            continue
+            shared_secret = kem.decap_secret(ciphertext)
+            payload_key, mac_key = derive_session_keys(shared_secret)
+            print("[SAT] Key exchange complete. AES-256 session key active.")
 
-                        pt = aes_decrypt(payload_key, cparsed["data"])
-                        cmd = json.loads(pt.decode("utf-8"))
-                        print(f"[TC] VALIDATED COMMAND (seq={cseq}): {cmd}")
-                        if isinstance(cmd, dict) and cmd.get("cmd") == "SET_MODE":
-                            sc.mode = cmd.get("value", "NOMINAL")
-                    except Exception as e:
-                        print(f"[SAT] Command decrypt/parse error: {e}")
-            except socket.timeout:
+            seq = 1
+            while True:
+                tlm = sc.telemetry_dict()
+                tlm_json = json.dumps(tlm).encode("utf-8")
+                encrypted = aes_encrypt(payload_key, tlm_json)
+                frame = make_telemetry_frame(seq, encrypted)
+                seq = (seq + 1) % 16384
+                conn.sendall(struct.pack(">I", len(frame)) + frame)
+
+                conn.settimeout(0.2)
+                try:
+                    hdr = conn.recv(4)
+                    if hdr and len(hdr) == 4:
+                        clen = struct.unpack(">I", hdr)[0]
+                        cdata = b""
+                        while len(cdata) < clen:
+                            cdata += conn.recv(clen - len(cdata))
+                        try:
+                            cparsed = CCSDSPacket.unpack(cdata)
+                            cseq = cparsed["seq_count"]
+
+                            if not replay_filter.validate_and_update(cseq):
+                                print(f"[SECURITY ALERT] REPLAY REJECTED (seq={cseq})")
+                                continue
+
+                            pt = aes_decrypt(payload_key, cparsed["data"])
+                            cmd = json.loads(pt.decode("utf-8"))
+                            print(f"[TC] COMMAND VALIDATED: {cmd}")
+                            if isinstance(cmd, dict) and cmd.get("cmd") == "SET_MODE":
+                                sc.mode = cmd.get("value", "NOMINAL")
+                        except Exception as e:
+                            pass
+                except socket.timeout:
+                    pass
+                finally:
+                    conn.settimeout(None)
+
+                time.sleep(1.0)
+
+        except (ConnectionResetError, BrokenPipeError, socket.error):
+            print("[SAT] Ground station disconnected. Resetting link listener...")
+            try:
+                conn.close()
+            except Exception:
                 pass
-            finally:
-                conn.settimeout(None)
-
-            time.sleep(1.0)
-
-    except (ConnectionResetError, BrokenPipeError, KeyboardInterrupt):
-        print("\n[SAT] Link lost or shutdown. Safe mode.")
-    finally:
-        conn.close()
-        srv.close()
 
 if __name__ == "__main__":
     main()
