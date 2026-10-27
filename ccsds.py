@@ -1,13 +1,58 @@
 ﻿"""
-KAVACH CCSDS Space Packet Layer
-Simplified standards-inspired CCSDS 133.0-B Primary Header
-for post-quantum encrypted satellite TM/TC frames.
+KAVACH CCSDS Space Packet & Cryptographic Engine v3.0
+- CCSDS 133.0-B Primary Header Framing
+- HKDF-SHA256 Key Derivation (NIST SP 800-56C)
+- 64-Frame Sliding Anti-Replay Window Filter
 """
 import struct
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 
 APID_TELEMETRY = 0x100
 APID_TELECOMMAND = 0x200
 APID_HANDSHAKE = 0x001
+
+class AntiReplayWindow:
+    def __init__(self, window_size: int = 64):
+        self.window_size = window_size
+        self.max_seq = -1
+        self.bitmap = 0
+
+    def validate_and_update(self, seq: int) -> bool:
+        if self.max_seq == -1:
+            self.max_seq = seq
+            self.bitmap = 1
+            return True
+
+        if seq > self.max_seq:
+            diff = seq - self.max_seq
+            if diff < self.window_size:
+                self.bitmap = (self.bitmap << diff) | 1
+            else:
+                self.bitmap = 1
+            self.max_seq = seq
+            return True
+
+        diff = self.max_seq - seq
+        if diff >= self.window_size:
+            return False  # Replayed packet is too old
+
+        if (self.bitmap & (1 << diff)) != 0:
+            return False  # Already received (Replay Attack)
+
+        self.bitmap |= (1 << diff)
+        return True
+
+def derive_session_keys(shared_secret: bytes) -> tuple[bytes, bytes]:
+    """Derives separate Payload Key (32B) and MAC Key (32B) using HKDF-SHA256"""
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64,
+        salt=b"KAVACH-LEO-SALT-V1",
+        info=b"KAVACH-HKDF-SPACE-LINK",
+    )
+    derived = hkdf.derive(shared_secret)
+    return derived[:32], derived[32:]
 
 class CCSDSPacket:
     def __init__(self, apid: int, seq_count: int, data: bytes, is_telecommand: bool = False):
