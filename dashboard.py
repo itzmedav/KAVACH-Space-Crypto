@@ -7,250 +7,452 @@ import pandas as pd
 from ccsds import derive_session_keys, pack_ccsds_header, unpack_ccsds_header
 from rf_channel import corrupt_payload
 from oqs import KeyEncapsulation
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 st.set_page_config(
-    page_title="KAVACH - Post-Quantum Satellite Mission Control",
+    page_title="KAVACH Mission Control",
     page_icon="🛰️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# ── Minimal Aerospace Theme ──────────────────────────────────────────────
 st.markdown("""
 <style>
-    .stApp { background-color: #0b0f19; color: #e0e6ed; }
-    .metric-card {
-        background: linear-gradient(135deg, #161e2e 0%, #0d131d 100%);
-        border: 1px solid #1e293b;
-        border-radius: 10px;
-        padding: 15px;
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'IBM Plex Sans', sans-serif;
     }
-    .status-badge-ok {
-        background-color: rgba(16, 185, 129, 0.2);
-        color: #10b981;
-        border: 1px solid #10b981;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-weight: bold;
+    .stApp {
+        background: #070b12;
+        color: #c8d0dc;
     }
-    .status-badge-safe {
-        background-color: rgba(245, 158, 11, 0.2);
-        color: #f59e0b;
-        border: 1px solid #f59e0b;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-weight: bold;
+    /* Hide Streamlit chrome */
+    #MainMenu, footer, header {visibility: hidden;}
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 1rem;
+        max-width: 1400px;
     }
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background: #0a0f18;
+        border-right: 1px solid #1a2332;
+    }
+    section[data-testid="stSidebar"] .stMarkdown {
+        color: #8b9bb4;
+    }
+    /* Metric cards */
+    .k-card {
+        background: #0d1520;
+        border: 1px solid #1a2332;
+        border-radius: 6px;
+        padding: 14px 16px;
+        height: 100%;
+    }
+    .k-label {
+        font-size: 0.7rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #5a6a82;
+        margin-bottom: 6px;
+        font-weight: 500;
+    }
+    .k-value {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 1.45rem;
+        font-weight: 500;
+        color: #e8eef7;
+        line-height: 1.2;
+    }
+    .k-unit {
+        font-size: 0.75rem;
+        color: #5a6a82;
+        margin-left: 4px;
+    }
+    /* Status pills */
+    .pill {
+        display: inline-block;
+        font-size: 0.72rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        padding: 3px 10px;
+        border-radius: 3px;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    .pill-ok   { background: #0d2818; color: #3dd68c; border: 1px solid #1a4d32; }
+    .pill-safe { background: #2a1f08; color: #f0a500; border: 1px solid #5c4200; }
+    .pill-pqc  { background: #0a1f2a; color: #00d4aa; border: 1px solid #0d4a3e; }
+    .pill-alert{ background: #2a0f0f; color: #ff6b6b; border: 1px solid #5c1a1a; }
+    /* Section headers */
+    .sec {
+        font-size: 0.72rem;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: #5a6a82;
+        font-weight: 600;
+        margin: 18px 0 10px 0;
+        border-bottom: 1px solid #1a2332;
+        padding-bottom: 6px;
+    }
+    /* Buttons in sidebar */
+    .stButton > button {
+        width: 100%;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        border: 1px solid #1a2332;
+        background: #0d1520;
+        color: #c8d0dc;
+        transition: all 0.15s ease;
+    }
+    .stButton > button:hover {
+        border-color: #00d4aa;
+        color: #00d4aa;
+        background: #0a1a18;
+    }
+    /* Dataframe */
+    .stDataFrame { border: 1px solid #1a2332; border-radius: 4px; }
+    /* JSON */
+    .stJson { background: #0d1520 !important; border: 1px solid #1a2332; border-radius: 4px; }
+    /* Dividers */
+    hr { border-color: #1a2332 !important; margin: 0.8rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
-if 'history' not in st.session_state:
-    st.session_state.history = []
-if 'seq_count' not in st.session_state:
-    st.session_state.seq_count = 1
-if 'replays_blocked' not in st.session_state:
-    st.session_state.replays_blocked = 0
-if 'tampered_blocked' not in st.session_state:
-    st.session_state.tampered_blocked = 0
-if 'cmd_logs' not in st.session_state:
-    st.session_state.cmd_logs = []
+# ── Session State ────────────────────────────────────────────────────────
+for key, default in [
+    ("history", []), ("seq_count", 1),
+    ("replays_blocked", 0), ("tampered_blocked", 0),
+    ("cmd_logs", [])
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-st.sidebar.title("🛰️ KAVACH Mission Control")
-st.sidebar.markdown("**Post-Quantum Space Protocol**")
+# ── Sidebar ──────────────────────────────────────────────────────────────
+st.sidebar.markdown("## KAVACH")
+st.sidebar.caption("Post-Quantum LEO Link")
 st.sidebar.markdown("---")
 
-st.sidebar.markdown("### 📡 Encrypted Telecommand Dispatch")
-col_c1, col_c2 = st.sidebar.columns(2)
-cmd_safe = col_c1.button("🔴 SAFE MODE")
-cmd_nom = col_c2.button("🟢 NOMINAL")
+st.sidebar.markdown('<div class="sec">Telecommand</div>', unsafe_allow_html=True)
+c1, c2 = st.sidebar.columns(2)
+cmd_safe = c1.button("SAFE MODE")
+cmd_nom  = c2.button("NOMINAL")
+c3, c4 = st.sidebar.columns(2)
+cmd_ecl  = c3.button("ECLIPSE")
+cmd_det  = c4.button("DETUMBLE")
 
-col_c3, col_c4 = st.sidebar.columns(2)
-cmd_ecl = col_c3.button("🌑 ECLIPSE")
-cmd_det = col_c4.button("🌀 DETUMBLE")
+st.sidebar.markdown('<div class="sec">Pen-Test</div>', unsafe_allow_html=True)
+inject_replay = st.sidebar.button("REPLAY ATTACK")
+inject_tamper = st.sidebar.button("BIT-FLIP TAMPER")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### ⚔️ Cyber Attack Harness")
-inject_replay = st.sidebar.button("⚡ INJECT REPLAY ATTACK")
-inject_tamper = st.sidebar.button("💥 INJECT BIT-FLIP TAMPERING")
+st.sidebar.markdown("""
+<div style="font-size:0.7rem;color:#5a6a82;line-height:1.6;">
+ML-KEM-768 · HKDF-SHA256<br>
+AES-256-GCM · CCSDS 133.0-B<br>
+64-Frame Anti-Replay
+</div>
+""", unsafe_allow_html=True)
 
-def dispatch_telecommand(command_str=None, attack_mode=None):
+# ── Socket Dispatch ──────────────────────────────────────────────────────
+def dispatch(command_str=None, attack_mode=None):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2.0)
-        s.connect(('127.0.0.1', 9999))
-        
+        s.connect(("127.0.0.1", 9999))
+
         raw_pk = s.recv(2048)
         if not raw_pk:
             s.close()
             return None, None
-            
-        with KeyEncapsulation('Kyber768') as client_kem:
-            ciphertext, shared_secret = client_kem.encap_secret(raw_pk)
-            
-        s.sendall(ciphertext)
-        k_enc, _ = derive_session_keys(shared_secret)
-        
+
+        with KeyEncapsulation("Kyber768") as kem:
+            ct, ss = kem.encap_secret(raw_pk)
+        s.sendall(ct)
+        k_enc, _ = derive_session_keys(ss)
+
         frame = s.recv(4096)
         hdr, payload = unpack_ccsds_header(frame)
-        
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         aesgcm = AESGCM(k_enc)
-        nonce = payload[:12]
-        ct_tag = payload[12:]
-        
+        nonce, ct_tag = payload[:12], payload[12:]
         try:
             pt = aesgcm.decrypt(nonce, ct_tag, frame[:6])
-            telemetry = json.loads(pt.decode('utf-8'))
+            telemetry = json.loads(pt.decode())
         except Exception as e:
-            telemetry = {"error": f"Decryption failed: {e}"}
+            telemetry = {"error": str(e)}
 
         if command_str:
-            cmd_payload = json.dumps({"cmd": command_str, "timestamp": time.time()}).encode('utf-8')
+            body = json.dumps({"cmd": command_str, "ts": time.time()}).encode()
             seq = st.session_state.seq_count
             st.session_state.seq_count += 1
-            
-            hdr_tc = pack_ccsds_header(apid=0x200, seq_count=seq, payload_len=len(cmd_payload))
-            nonce_tc = bytes([seq % 256] * 12)
-            ct_tc = aesgcm.encrypt(nonce_tc, cmd_payload, hdr_tc)
-            
-            s.sendall(hdr_tc + nonce_tc + ct_tc)
-            st.session_state.cmd_logs.append({"seq": seq, "cmd": command_str, "status": "AUTHENTICATED & EXECUTED"})
-
-        elif attack_mode == 'replay':
-            hdr_bad = pack_ccsds_header(0x200, st.session_state.seq_count - 1, len(frame[:6]))
-            s.sendall(hdr_bad + payload)
+            h = pack_ccsds_header(0x200, seq, len(body), packet_type=1)
+            n = bytes([seq % 256] * 12)
+            s.sendall(h + n + aesgcm.encrypt(n, body, h))
+            st.session_state.cmd_logs.append(
+                {"seq": seq, "cmd": command_str, "status": "OK"}
+            )
+        elif attack_mode == "replay":
+            h = pack_ccsds_header(0x200, max(0, st.session_state.seq_count - 1), 6)
+            s.sendall(h + payload)
             st.session_state.replays_blocked += 1
-        elif attack_mode == 'tamper':
-            corrupted_payload = corrupt_payload(payload)
-            hdr_tc = pack_ccsds_header(0x200, st.session_state.seq_count, len(corrupted_payload))
-            s.sendall(hdr_tc + corrupted_payload)
+        elif attack_mode == "tamper":
+            bad = corrupt_payload(payload)
+            h = pack_ccsds_header(0x200, st.session_state.seq_count, len(bad))
+            s.sendall(h + bad)
             st.session_state.tampered_blocked += 1
             st.session_state.seq_count += 1
-            
+
         s.close()
         return telemetry, hdr
     except Exception:
         return None, None
 
-pending_cmd = None
-if cmd_safe: pending_cmd = "CMD_SAFE_MODE"
-elif cmd_nom: pending_cmd = "CMD_NOMINAL"
-elif cmd_ecl: pending_cmd = "CMD_ECLIPSE"
-elif cmd_det: pending_cmd = "CMD_DETUMBLE"
+pending = None
+if cmd_safe: pending = "CMD_SAFE_MODE"
+elif cmd_nom: pending = "CMD_NOMINAL"
+elif cmd_ecl: pending = "CMD_ECLIPSE"
+elif cmd_det: pending = "CMD_DETUMBLE"
+attack = "replay" if inject_replay else ("tamper" if inject_tamper else None)
 
-attack = 'replay' if inject_replay else ('tamper' if inject_tamper else None)
-telemetry, hdr = dispatch_telecommand(command_str=pending_cmd, attack_mode=attack)
+telemetry, hdr = dispatch(command_str=pending, attack_mode=attack)
 
-st.title("🛡️ KAVACH: Post-Quantum LEO Satellite Command & Telemetry")
+# ── Header Bar ───────────────────────────────────────────────────────────
+mode = telemetry.get("mode", "—") if telemetry else "—"
+pill_cls = "pill-ok" if mode == "NOMINAL" else "pill-safe"
 
-col_head1, col_head2, col_head3, col_head4 = st.columns(4)
-sat_mode = telemetry.get('mode', 'NOMINAL') if telemetry else 'NOMINAL'
-badge_style = "status-badge-ok" if sat_mode == "NOMINAL" else "status-badge-safe"
+h1, h2, h3, h4, h5 = st.columns([2.2, 1.2, 1.2, 1.2, 1.4])
+with h1:
+    st.markdown(f"""
+    <div class="k-card">
+      <div class="k-label">Flight Mode</div>
+      <span class="pill {pill_cls}">{mode}</span>
+      &nbsp;<span class="pill pill-pqc">ML-KEM-768</span>
+    </div>
+    """, unsafe_allow_html=True)
+with h2:
+    st.markdown(f"""
+    <div class="k-card">
+      <div class="k-label">Replays Blocked</div>
+      <div class="k-value" style="color:#ff6b6b;">{st.session_state.replays_blocked}</div>
+    </div>
+    """, unsafe_allow_html=True)
+with h3:
+    st.markdown(f"""
+    <div class="k-card">
+      <div class="k-label">Tamper Rejected</div>
+      <div class="k-value" style="color:#f0a500;">{st.session_state.tampered_blocked}</div>
+    </div>
+    """, unsafe_allow_html=True)
+with h4:
+    ecl = telemetry.get("eclipse", False) if telemetry else False
+    st.markdown(f"""
+    <div class="k-card">
+      <div class="k-label">Eclipse</div>
+      <div class="k-value" style="font-size:1.1rem;">{'YES' if ecl else 'NO'}</div>
+    </div>
+    """, unsafe_allow_html=True)
+with h5:
+    st.markdown(f"""
+    <div class="k-card">
+      <div class="k-label">Link</div>
+      <span class="pill pill-ok">ENCRYPTED</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-with col_head1:
-    st.markdown(f"<div class='metric-card'><h4>Flight Mode</h4><span class='{badge_style}'>{sat_mode}</span></div>", unsafe_allow_html=True)
-with col_head2:
-    st.markdown(f"<div class='metric-card'><h4>Replays Blocked</h4><h2 style='color:#ef4444;'>{st.session_state.replays_blocked}</h2></div>", unsafe_allow_html=True)
-with col_head3:
-    st.markdown(f"<div class='metric-card'><h4>Tampered Frames Rejected</h4><h2 style='color:#f59e0b;'>{st.session_state.tampered_blocked}</h2></div>", unsafe_allow_html=True)
-with col_head4:
-    st.markdown("<div class='metric-card'><h4>Crypto Engine</h4><h4 style='color:#00ffcc;'>ML-KEM-768 ACTIVE</h4></div>", unsafe_allow_html=True)
+st.markdown("")  # spacer
 
-st.markdown("---")
-
-if telemetry and 'error' not in telemetry:
+# ── Main Content ─────────────────────────────────────────────────────────
+if telemetry and "error" not in telemetry:
     st.session_state.history.append(telemetry)
-    if len(st.session_state.history) > 30:
+    if len(st.session_state.history) > 40:
         st.session_state.history.pop(0)
-
     df = pd.DataFrame(st.session_state.history)
-    
-    col_map, col_metrics = st.columns([6, 4])
-    
-    with col_map:
-        st.subheader("🌐 Ground Track & Pass Geometry (ISTRAC Bengaluru)")
-        fig_map = go.Figure()
-        
-        fig_map.add_trace(go.Scattergeo(
+
+    left, right = st.columns([5.5, 4.5], gap="medium")
+
+    # ── Ground Track ──
+    with left:
+        st.markdown('<div class="sec">Ground Track · ISTRAC Bengaluru</div>', unsafe_allow_html=True)
+        fig = go.Figure()
+        fig.add_trace(go.Scattergeo(
             lat=[12.9716], lon=[77.5946],
-            mode='markers+text',
-            text=["ISTRAC Bengaluru"],
+            mode="markers+text", text=["ISTRAC"],
             textposition="top center",
-            marker=dict(size=14, color='#00ffcc', symbol='triangle-up'),
-            name="Ground Station"
+            textfont=dict(size=10, color="#00d4aa", family="IBM Plex Mono"),
+            marker=dict(size=11, color="#00d4aa", symbol="triangle-up"),
+            name="GS", hoverinfo="skip"
         ))
-        
-        if 'lat' in df.columns:
-            fig_map.add_trace(go.Scattergeo(
-                lat=df['lat'], lon=df['lon'],
-                mode='lines+markers',
-                line=dict(width=2, color='#3b82f6'),
-                marker=dict(size=8, color='#ef4444'),
-                name="KAVACH-1 Track"
+        if "lat" in df.columns and len(df) > 0:
+            fig.add_trace(go.Scattergeo(
+                lat=df["lat"], lon=df["lon"],
+                mode="lines",
+                line=dict(width=1.5, color="#3b82f6"),
+                name="Track", hoverinfo="skip"
             ))
-            
-        fig_map.update_layout(
+            fig.add_trace(go.Scattergeo(
+                lat=[df["lat"].iloc[-1]], lon=[df["lon"].iloc[-1]],
+                mode="markers",
+                marker=dict(size=9, color="#ff6b6b", symbol="circle"),
+                name="SAT", hoverinfo="skip"
+            ))
+        fig.update_layout(
             geo=dict(
-                projection_type='orthographic',
-                showland=True, landcolor='#1e293b',
-                showocean=True, oceancolor='#0f172a',
-                showcountries=True, countrycolor='#334155',
-                bgcolor='rgba(0,0,0,0)'
+                projection_type="orthographic",
+                projection_rotation=dict(
+                    lon=float(df["lon"].iloc[-1]) if "lon" in df.columns and len(df) else 78,
+                    lat=float(df["lat"].iloc[-1]) if "lat" in df.columns and len(df) else 13
+                ),
+                showland=True, landcolor="#111827",
+                showocean=True, oceancolor="#070b12",
+                showcountries=True, countrycolor="#1e293b",
+                showcoastlines=True, coastlinecolor="#1e293b",
+                bgcolor="rgba(0,0,0,0)",
+                lonaxis=dict(showgrid=True, gridcolor="#1a2332", gridwidth=0.5),
+                lataxis=dict(showgrid=True, gridcolor="#1a2332", gridwidth=0.5),
             ),
             margin=dict(l=0, r=0, t=0, b=0),
-            paper_bgcolor='rgba(0,0,0,0)',
-            height=380
+            paper_bgcolor="rgba(0,0,0,0)",
+            height=360,
+            showlegend=False
         )
-        st.plotly_chart(fig_map, width="stretch")
-        
-    with col_metrics:
-        st.subheader("⚡ Orbital Telemetry & State Metrics")
-        m1, m2 = st.columns(2)
-        m1.metric("Altitude", f"{telemetry.get('alt_km', 508):.2f} km")
-        m2.metric("Velocity", f"{telemetry.get('vel_kms', 7.61):.2f} km/s")
-        
-        m3, m4 = st.columns(2)
-        m3.metric("Battery Voltage", f"{telemetry.get('battery_v', 8.2):.2f} V")
-        m4.metric("Solar Power", f"{telemetry.get('solar_w', 14.2):.2f} W")
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
-        m5, m6 = st.columns(2)
-        m5.metric("Angular Rate", f"{telemetry.get('ang_vel', 0.5):.2f} °/s")
-        m6.metric("Temp / Eclipse", f"{telemetry.get('temp_c', 22):.1f} °C / {telemetry.get('eclipse', False)}")
+    # ── Telemetry Strip ──
+    with right:
+        st.markdown('<div class="sec">Orbital State</div>', unsafe_allow_html=True)
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Altitude</div>
+              <div class="k-value">{telemetry.get('alt_km',0):.1f}<span class="k-unit">km</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+        with r1c2:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Velocity</div>
+              <div class="k-value">{telemetry.get('vel_kms',0):.2f}<span class="k-unit">km/s</span></div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.subheader("📈 Real-Time Bus & Sensor Trends")
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        fig_batt = go.Figure()
-        fig_batt.add_trace(go.Scatter(y=df['battery_v'], mode='lines+markers', name='Battery (V)', line=dict(color='#10b981')))
-        fig_batt.update_layout(title="Battery Bus Voltage (V)", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#e0e6ed'), height=230)
-        st.plotly_chart(fig_batt, width="stretch")
-    with col_t2:
-        fig_solar = go.Figure()
-        fig_solar.add_trace(go.Scatter(y=df['solar_w'], mode='lines+markers', name='Solar Array (W)', line=dict(color='#f59e0b')))
-        fig_solar.update_layout(title="Solar Array Power Generation (W)", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#e0e6ed'), height=230)
-        st.plotly_chart(fig_solar, width="stretch")
+        st.markdown("")
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Battery</div>
+              <div class="k-value">{telemetry.get('battery_v',0):.2f}<span class="k-unit">V</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+        with r2c2:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Solar</div>
+              <div class="k-value">{telemetry.get('solar_w',0):.1f}<span class="k-unit">W</span></div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    col_l1, col_l2 = st.columns(2)
-    with col_l1:
-        st.subheader("📦 CCSDS 133.0-B Primary Header Inspection")
+        st.markdown("")
+        r3c1, r3c2 = st.columns(2)
+        with r3c1:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Angular Rate</div>
+              <div class="k-value">{telemetry.get('ang_vel',0):.2f}<span class="k-unit">°/s</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+        with r3c2:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Temp</div>
+              <div class="k-value">{telemetry.get('temp_c',0):.1f}<span class="k-unit">°C</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("")
+        r4c1, r4c2 = st.columns(2)
+        with r4c1:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">Doppler</div>
+              <div class="k-value">{telemetry.get('doppler_hz',0):.0f}<span class="k-unit">Hz</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+        with r4c2:
+            st.markdown(f"""
+            <div class="k-card">
+              <div class="k-label">RSSI / SNR</div>
+              <div class="k-value" style="font-size:1.1rem;">{telemetry.get('rssi_dbm',0):.0f}<span class="k-unit">dBm</span>
+              &nbsp;{telemetry.get('snr_db',0):.0f}<span class="k-unit">dB</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ── Trends ──
+    st.markdown('<div class="sec">Bus Trends</div>', unsafe_allow_html=True)
+    t1, t2, t3 = st.columns(3)
+
+    def mini_chart(y, title, color):
+        f = go.Figure()
+        f.add_trace(go.Scatter(
+            y=y, mode="lines",
+            line=dict(width=1.5, color=color),
+            fill="tozeroy", fillcolor=color.replace(")", ",0.08)").replace("rgb", "rgba") if False else "rgba(0,212,170,0.06)"
+        ))
+        f.update_layout(
+            title=dict(text=title, font=dict(size=11, color="#5a6a82", family="IBM Plex Sans")),
+            margin=dict(l=0, r=0, t=28, b=0),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=160,
+            xaxis=dict(visible=False),
+            yaxis=dict(gridcolor="#1a2332", tickfont=dict(size=9, color="#5a6a82"), zeroline=False),
+            showlegend=False
+        )
+        return f
+
+    with t1:
+        if "battery_v" in df.columns:
+            st.plotly_chart(mini_chart(df["battery_v"], "BATTERY (V)", "#3dd68c"), width="stretch", config={"displayModeBar": False})
+    with t2:
+        if "solar_w" in df.columns:
+            st.plotly_chart(mini_chart(df["solar_w"], "SOLAR (W)", "#f0a500"), width="stretch", config={"displayModeBar": False})
+    with t3:
+        if "ang_vel" in df.columns:
+            st.plotly_chart(mini_chart(df["ang_vel"], "ANGULAR RATE (°/s)", "#3b82f6"), width="stretch", config={"displayModeBar": False})
+
+    # ── Bottom: Header + Logs ──
+    st.markdown('<div class="sec">CCSDS Frame · Command Log</div>', unsafe_allow_html=True)
+    b1, b2 = st.columns([1, 1], gap="medium")
+    with b1:
         if hdr:
             st.json({
-                "Version": hdr['version'],
-                "Packet Type": "TC (Telecommand)" if hdr['type'] == 1 else "TM (Telemetry)",
                 "APID": f"0x{hdr['apid']:03X}",
-                "Sequence Count": hdr['seq'],
-                "Payload Length (bytes)": hdr['len']
+                "Type": "TM" if hdr["type"] == 0 else "TC",
+                "Seq": hdr["seq"],
+                "Len": hdr["len"],
+                "Ver": hdr["version"]
             })
-    with col_l2:
-        st.subheader("📜 Authenticated Telecommand Execution Log")
+    with b2:
         if st.session_state.cmd_logs:
-            st.dataframe(pd.DataFrame(st.session_state.cmd_logs).tail(5), width="stretch")
+            st.dataframe(
+                pd.DataFrame(st.session_state.cmd_logs).tail(6),
+                width="stretch",
+                hide_index=True
+            )
         else:
-            st.info("No telecommands dispatched yet. Use sidebar controls.")
+            st.caption("No telecommands yet.")
 
 else:
-    st.warning("⚠️ Connecting to Spacecraft Flight Software on TCP:9999...")
+    st.markdown("""
+    <div class="k-card" style="text-align:center;padding:40px;">
+      <div class="k-label">Link Status</div>
+      <div class="k-value" style="font-size:1rem;color:#5a6a82;">Connecting to spacecraft · TCP 9999</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 time.sleep(1.5)
 st.rerun()
