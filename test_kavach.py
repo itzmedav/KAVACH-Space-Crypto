@@ -1,44 +1,49 @@
-﻿"""
-KAVACH Automated Unit Test Suite
-Run locally with: pytest
-Tests ML-KEM-768 key exchange, HKDF-SHA256 key derivation,
-AES-256-GCM encryption, CCSDS packing/unpacking, and Anti-Replay protection.
-"""
 import pytest
-import oqs
-import os
-import json
-from ccsds import CCSDSPacket, make_telemetry_frame, derive_session_keys, AntiReplayWindow
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from ccsds import MLKEM768Simulator, HKDFKeyDerivation, AES256GCMCipher, CCSDSHelper, SlidingWindowAntiReplay
+from rf_channel import calculate_rf_metrics
+from constellation import ConstellationManager
 
 def test_ml_kem_768_handshake():
-    with oqs.KeyEncapsulation("ML-KEM-768") as server_kem:
-        pubkey = server_kem.generate_keypair()
-        with oqs.KeyEncapsulation("ML-KEM-768") as client_kem:
-            ciphertext, client_secret = client_kem.encap_secret(pubkey)
-        server_secret = server_kem.decap_secret(ciphertext)
-        assert server_secret == client_secret
+    sim = MLKEM768Simulator()
+    pk, sk = sim.generate_keypair()
+    ciphertext, sender_secret = sim.encapsulate(pk)
+    receiver_secret = sim.decapsulate(ciphertext, sk)
+    assert sender_secret == receiver_secret
+    assert len(pk) == 1184
+    assert len(ciphertext) == 1088
 
 def test_hkdf_key_derivation():
-    raw_secret = os.urandom(32)
-    payload_k1, mac_k1 = derive_session_keys(raw_secret)
-    payload_k2, mac_k2 = derive_session_keys(raw_secret)
-    assert payload_k1 == payload_k2
-    assert len(payload_k1) == 32
-    assert payload_k1 != mac_k1
+    shared_secret = b"QUANTUM_SECRET_SEED_12345"
+    key1 = HKDFKeyDerivation.derive_key(shared_secret)
+    key2 = HKDFKeyDerivation.derive_key(shared_secret)
+    assert key1 == key2
+    assert len(key1) == 32
 
 def test_ccsds_packet_roundtrip():
-    data = b"HELLO ISRO"
-    frame = make_telemetry_frame(seq=42, payload=data)
-    parsed = CCSDSPacket.unpack(frame)
+    header = CCSDSHelper.pack_primary_header(apid=0x100, seq_count=42, data_len=64)
+    parsed = CCSDSHelper.unpack_primary_header(header)
     assert parsed["apid"] == 0x100
     assert parsed["seq_count"] == 42
-    assert parsed["data"] == data
+    assert parsed["data_len"] == 64
 
 def test_anti_replay_window():
-    window = AntiReplayWindow(window_size=64)
-    assert window.validate_and_update(1) is True
-    assert window.validate_and_update(2) is True
-    assert window.validate_and_update(2) is False  # Replay rejected!
-    assert window.validate_and_update(1) is False  # Replay rejected!
-    assert window.validate_and_update(3) is True
+    filter = SlidingWindowAntiReplay(window_size=64)
+    assert filter.check_and_update(1) == True
+    assert filter.check_and_update(2) == True
+    assert filter.check_and_update(1) == False
+    assert filter.check_and_update(5) == True
+    assert filter.check_and_update(3) == True
+
+def test_constellation_isl_handshake():
+    cm = ConstellationManager()
+    cm.update_orbit_positions()
+    res = cm.establish_isl_handshake()
+    assert res["handshake_status"] == "SUCCESS"
+    ranges = cm.calculate_isl_ranges()
+    assert ranges["Alpha-Beta_km"] > 0
+
+def test_rf_channel_physics():
+    metrics = calculate_rf_metrics(alt_km=500.0, freq_mhz=433.92)
+    assert metrics["fspl_db"] > 130.0
+    assert metrics["doppler_khz"] > 5.0
+    assert metrics["snr_db"] > 0.0
