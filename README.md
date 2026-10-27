@@ -11,13 +11,13 @@
 **KAVACH** (*Sanskrit for Armor*) is an end-to-end, ultra-low latency post-quantum security architecture engineered specifically for Low Earth Orbit (LEO) nanosatellite constellations (CubeSats, 1U-6U). Developed in compliance with **NIST FIPS 203 (ML-KEM-768)**, **NIST SP 800-56C (HKDF-SHA256)**, **AES-256-GCM**, and **CCSDS 133.0-B-2 Space Packet Protocol** standards.
 
 ## Key Highlights
-- **NIST Category 3 Post-Quantum Key Exchange**: Implements Kyber-768 / ML-KEM-768 encapsulation for post-quantum forward secrecy.
-- **Zero Quantum Overhead Payload Encryption**: Utilizes 256-bit AES-GCM AEAD encryption, achieving < 0.2 ms cryptographic latency per frame.
-- **CCSDS 133.0-B Bit-Level Standard Alignment**: Wraps encrypted payloads into standard 6-byte CCSDS Primary Headers (APID 0x001 Handshake, 0x100 Telemetry, 0x200 Telecommand).
+- **NIST Category 3 Post-Quantum Key Exchange**: Kyber-768 / ML-KEM-768 encapsulation for post-quantum forward secrecy.
+- **Zero Overhead Payload Encryption**: 256-bit AES-GCM AEAD encryption (< 0.2 ms latency).
+- **CCSDS 133.0-B Framing**: Standard 6-byte CCSDS Primary Headers (APID 0x001 Handshake, 0x100 Telemetry, 0x200 Telecommand).
 - **Anti-Replay Window Filter**: 64-frame sliding bitmask preventing replay attacks.
-- **Flight Computer Finite State Machine**: Dynamic state transitions across NOMINAL, SAFE_MODE, ECLIPSE, and DETUMBLE.
-- **Integrated Mission Control Cockpit**: Real-time 3D orthographic orbit visualization over ISTRAC Bengaluru (12.9716 N, 77.5946 E), 433.92 MHz SDR spectrum waterfall, and attack campaign simulator.
-- **Dual Software / Embedded Target**: Runs as Python 3.13 mission simulation and compiles directly to ESP32-S3 / CC1101 C++ platforms.
+- **Flight Computer State Machine**: Dynamic FSM transitions (NOMINAL, SAFE_MODE, ECLIPSE, DETUMBLE).
+- **Mission Control Cockpit**: Real-time 3D Earth track, 433.92 MHz SDR spectrum waterfall, 1,000-frame attack simulator.
+- **Embedded Hardware Target**: ESP32-S3 + CC1101 C++ firmware stack in irmware/.
 
 ## Quick Start
 `ash
