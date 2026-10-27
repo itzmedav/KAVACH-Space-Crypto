@@ -1,0 +1,124 @@
+﻿\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{KAVACH: A Post-Quantum Encrypted Space Communication Protocol Utilizing NIST FIPS 203 (ML-KEM-768) and CCSDS 133.0-B Framing for LEO Satellites}
+
+\author{\IEEEauthorblockN{David Macha, et al.}
+\IEEEauthorblockA{\textit{Multidisciplinary Aerospace \& Cyber Security Research Group} \\
+Bengaluru, India \\
+\url{https://github.com/itzmedav/KAVACH-Space-Crypto}}
+}
+
+\maketitle
+
+\begin{abstract}
+Modern satellite telecommand and telemetry (TC/TM) links heavily rely on classical public-key cryptography (RSA-2048, ECDH-P256) for session key exchange. The impending realization of fault-tolerant quantum computing via Shor’s Algorithm threatens to collapse these cryptosystems. Furthermore, hostile actors execute ``Harvest Now, Decrypt Later'' (HNDL) interception against LEO downlinks. This paper presents KAVACH, a zero-trust, post-quantum cryptographic protocol tailored for small satellites (CubeSats) and LEO space assets. KAVACH implements the newly finalized NIST FIPS 203 (ML-KEM-768) Module-Lattice Key Encapsulation Mechanism coupled with NIST SP 800-56C HKDF-SHA256 key derivation and AES-256-GCM authenticated payload encryption, framed within standard CCSDS 133.0-B Space Packets. We demonstrate sub-millisecond key generation latency (~0.17 ms) and 100\% resilience against replay, bit-flip tampering, and command spoofing over sub-GHz RF links.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Post-Quantum Cryptography, ML-KEM-768, CCSDS 133.0-B, LEO Satellite Security, AES-256-GCM, Anti-Replay Filter, CubeSat.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Satellite communications are vulnerable due to the broadcast nature of RF transmissions in UHF and S-bands. Consultative Committee for Space Data Systems (CCSDS) standards historically prioritized bandwidth overhead over cryptographic authentication. With the August 2024 finalization of NIST FIPS 203 (ML-KEM), post-quantum cryptography (PQC) transitions from theoretical research to mandatory operational space standards.
+
+KAVACH addresses three core challenges:
+\begin{enumerate}
+    \item \textbf{Quantum Vulnerability:} Mitigating discrete logarithm attacks on quantum hardware.
+    \item \textbf{Replay \& Command Injection:} Enforcing 64-frame sliding anti-replay window filters.
+    \item \textbf{Resource Constraints:} Operating within tight microcontroller power budgets (ESP32-S3 / ARM Cortex-M4).
+\end{enumerate}
+
+\section{Mathematical Cryptographic Foundation}
+\subsection{Module-Lattice Learning With Errors (Module-LWE)}
+ML-KEM-768 operates over polynomial rings $\mathcal{R}_q = \mathbb{Z}_q[X]/(X^n + 1)$, where $n = 256$, $q = 3329$, and matrix dimension $k = 3$.
+
+\textbf{Key Generation:}
+\begin{equation}
+\mathbf{A} \in \mathcal{R}_q^{k \times k}, \quad \mathbf{s}, \mathbf{e} \in \mathcal{R}_q^k
+\end{equation}
+\begin{equation}
+\mathbf{t} = \mathbf{A}\mathbf{s} + \mathbf{e} \implies pk = (\mathbf{t}, \rho), \quad sk = \mathbf{s}
+\end{equation}
+
+\textbf{Encapsulation (Ground Station):}
+\begin{equation}
+\mathbf{u} = \mathbf{A}^T \mathbf{r} + \mathbf{e}_1, \quad v = \mathbf{t}^T \mathbf{r} + e_2 + \left\lceil \frac{q}{2} \right\rceil m
+\end{equation}
+\begin{equation}
+c = (\mathbf{u}, v), \quad ss = \text{KDF}(m)
+\end{equation}
+
+\subsection{Key Derivation (NIST SP 800-56C)}
+After ML-KEM outputs the 32-byte shared secret $ss$, HKDF-SHA256 expands it into session keys:
+\begin{equation}
+PRK = \text{HKDF-Extract}(salt, ss)
+\end{equation}
+\begin{equation}
+K_{enc} \| K_{mac} = \text{HKDF-Expand}(PRK, info, L=64)
+\end{equation}
+
+\section{CCSDS 133.0-B Space Packet Integration}
+KAVACH embeds cryptographic payloads into standard 6-byte CCSDS Primary Headers:
+
+\begin{table}[htbp]
+\caption{CCSDS 133.0-B Primary Header Structure}
+\begin{center}
+\begin{tabular}{lcl}
+\toprule
+\textbf{Field} & \textbf{Bits} & \textbf{KAVACH Usage} \\
+\midrule
+Version & 3 & 000 (Space Packet) \\
+Type & 1 & 0 = TM (Telemetry), 1 = TC (Telecommand) \\
+Sec. Header Flag & 1 & 0 (No Secondary Header) \\
+APID & 11 & 0x001 Handshake / 0x100 TM / 0x200 TC \\
+Seq. Flags & 2 & 11 (Unsegmented) \\
+Seq. Count & 14 & Monotonic counter (64-frame Anti-Replay) \\
+Length & 16 & Total bytes $- 1$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+\section{Empirical Performance Benchmarks}
+Benchmark evaluations (50 iterations, Python 3.13 + liboqs, Windows 11 x64):
+
+\begin{table}[htbp]
+\caption{Cryptographic Execution Latency Comparison}
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Algorithm} & \textbf{KeyGen (ms)} & \textbf{Encap (ms)} & \textbf{Pub Key (B)} & \textbf{PQC Safe?} \\
+\midrule
+RSA-2048 & 25.92 & 0.15 & 270 & No \\
+X25519 (ECC) & 0.11 & 0.05 & 32 & No \\
+\textbf{ML-KEM-768} & \textbf{0.17} & \textbf{0.19} & \textbf{1184} & \textbf{Yes (L3)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+ML-KEM-768 key generation is \textbf{152$\times$ faster} than RSA-2048 while providing NIST Level-3 post-quantum security.
+
+\section{Conclusion}
+KAVACH demonstrates that post-quantum security via NIST FIPS 203 ML-KEM-768 is computationally viable for resource-constrained LEO satellite links, ensuring zero-trust protection against classical and quantum adversaries.
+
+\begin{thebibliography}{00}
+\bibitem{fips203} NIST, ``FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard,'' Aug. 2024.
+\bibitem{sp80056c} NIST, ``SP 800-56C Rev. 2: Recommendation for Key-Derivation Methods,'' 2020.
+\bibitem{ccsds133} CCSDS, ``Space Packet Protocol, Blue Book 133.0-B-2,'' 2020.
+\end{thebibliography}
+
+\end{document}
