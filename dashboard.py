@@ -1,164 +1,209 @@
+﻿"""
+KAVACH Mission Control Dashboard v2.0
+Streamlit + Plotly | CCSDS + LEO Telemetry | ML-KEM-768
+"""
 import streamlit as st
 import socket
-import base64
+import struct
 import json
 import time
-import oqs
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import plotly.graph_objects as go
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import oqs
+import os
+from ccsds import CCSDSPacket, make_telecommand_frame, make_handshake_frame
 
-# Streamlit Page Config
-st.set_page_config(page_title="KAVACH Real Control", page_icon="🛰️", layout="wide")
+st.set_page_config(page_title="KAVACH Mission Control", page_icon="🛡️", layout="wide")
 
-# Custom Styling
-st.markdown("""
+st.markdown(
+    """
 <style>
-    .main { background-color: #0B0E14; }
-    .stMetric { background-color: #161B22; padding: 15px; border-radius: 10px; border: 1px solid #30363D; }
-    h1, h2, h3 { color: #58A6FF; }
+.stApp { background-color: #0b0f19; color: #e0e6ed; }
+[data-testid="stSidebar"] { background-color: #111827; }
+h1, h2, h3 { color: #38bdf8 !important; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-st.title("🛰️ KAVACH — Real-Time Post-Quantum Mission Control")
-st.caption("Connected to Native C++ liboqs Engine | NIST FIPS 203 (ML-KEM-768) + AES-256-GCM")
+st.title("🛡️ KAVACH Mission Control")
+st.caption("Post-Quantum LEO Link  •  ML-KEM-768 + AES-256-GCM  •  CCSDS Space Packets")
 
-KEM_ALG = "ML-KEM-768" if "ML-KEM-768" in oqs.get_enabled_kem_mechanisms() else "Kyber768"
+SERVER = ("127.0.0.1", 9999)
 
-# ─── SOCKET & CRYPTO STATE MANAGEMENT ───
-if "sock" not in st.session_state:
-    st.session_state.sock = None
-if "aes" not in st.session_state:
-    st.session_state.aes = None
-if "nonce_counter" not in st.session_state:
-    st.session_state.nonce_counter = 0
 if "connected" not in st.session_state:
     st.session_state.connected = False
-if "history" not in st.session_state:
-    st.session_state.history = pd.DataFrame(columns=["Time", "Temp", "Voltage"])
+    st.session_state.sock = None
+    st.session_state.session_key = None
+    st.session_state.tlm_log = []
+    st.session_state.seq = 1
 
-def connect_and_handshake():
+def aes_encrypt(key, pt):
+    aes = AESGCM(key)
+    nonce = os.urandom(12)
+    return nonce + aes.encrypt(nonce, pt, None)
+
+def aes_decrypt(key, blob):
+    aes = AESGCM(key)
+    return aes.decrypt(blob[:12], blob[12:], None)
+
+def connect():
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(('localhost', 9999))
-        
-        # Handshake
-        hello = sock.recv(1024).decode().strip()
-        if "HELLO" in hello:
-            sock.send(b"KAVACH_ACK\n")
-            
-        # Key Exchange
-        pk_line = sock.recv(8192).decode().strip()
-        public_key = base64.b64decode(pk_line.split("PK:")[1])
-        
-        with oqs.KeyEncapsulation(KEM_ALG) as kem:
-            ciphertext, shared_secret = kem.encap_secret(public_key)
-            
-        sock.send(b"CT:" + base64.b64encode(ciphertext) + b"\n")
-        done = sock.recv(1024).decode().strip()
-        
-        if "DONE" in done:
-            st.session_state.aes = AESGCM(shared_secret)
-            st.session_state.sock = sock
-            st.session_state.connected = True
-            return True, shared_secret[:8].hex()
-    except Exception as e:
-        return False, str(e)
-    return False, "Failed"
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(SERVER)
 
-def send_real_command(cmd_str):
-    if not st.session_state.connected or not st.session_state.sock:
+        raw_len = s.recv(4)
+        n = struct.unpack(">I", raw_len)[0]
+        hs = b""
+        while len(hs) < n:
+            hs += s.recv(n - len(hs))
+
+        try:
+            parsed = CCSDSPacket.unpack(hs)
+            pk = parsed["data"]
+        except Exception:
+            pk = hs
+
+        with oqs.KeyEncapsulation("ML-KEM-768") as kem:
+            ct, ss = kem.encap_secret(pk)
+
+        session_key = ss[:32]
+        frame = make_handshake_frame(0, ct)
+        s.sendall(struct.pack(">I", len(frame)) + frame)
+        s.settimeout(1.0)
+
+        st.session_state.sock = s
+        st.session_state.session_key = session_key
+        st.session_state.connected = True
+        return True
+    except Exception as e:
+        st.error(f"Connection failed: {e}")
+        return False
+
+def recv_one_tlm():
+    s = st.session_state.sock
+    key = st.session_state.session_key
+    try:
+        hdr = s.recv(4)
+        if not hdr or len(hdr) < 4:
+            return None
+        n = struct.unpack(">I", hdr)[0]
+        data = b""
+        while len(data) < n:
+            chunk = s.recv(n - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        parsed = CCSDSPacket.unpack(data)
+        pt = aes_decrypt(key, parsed["data"])
+        tlm = json.loads(pt.decode("utf-8"))
+        tlm["_ccsds_apid"] = parsed["apid"]
+        tlm["_ccsds_seq"] = parsed["seq_count"]
+        return tlm
+    except socket.timeout:
         return None
-    try:
-        st.session_state.nonce_counter += 1
-        nonce = st.session_state.nonce_counter.to_bytes(12, 'big')
-        ct = st.session_state.aes.encrypt(nonce, cmd_str.encode(), None)
-        packet = base64.b64encode(nonce + ct).decode()
-        
-        # Transmit over socket to satellite.py
-        st.session_state.sock.send(f"ENC:{packet}\n".encode())
-        
-        # Receive encrypted response
-        resp = st.session_state.sock.recv(8192).decode().strip()
-        if resp.startswith("ENC:"):
-            raw = base64.b64decode(resp[4:])
-            r_nonce, r_ct = raw[:12], raw[12:]
-            decrypted = st.session_state.aes.decrypt(r_nonce, r_ct, None).decode()
-            return decrypted
-    except Exception as e:
-        st.session_state.connected = False
-        return f"ERROR: {e}"
-    return None
+    except Exception:
+        return None
 
-# ─── SIDEBAR ───
-st.sidebar.title("🛰️ Link Control")
-if not st.session_state.connected:
-    if st.sidebar.button("🔌 Establish ML-KEM-768 Link"):
-        success, info_str = connect_and_handshake()
-        if success:
-            st.sidebar.success(f"CONNECTED! Shared Secret: {info_str}...")
+def send_cmd(cmd_dict):
+    s = st.session_state.sock
+    key = st.session_state.session_key
+    blob = aes_encrypt(key, json.dumps(cmd_dict).encode())
+    frame = make_telecommand_frame(st.session_state.seq, blob)
+    st.session_state.seq = (st.session_state.seq + 1) % 16384
+    s.sendall(struct.pack(">I", len(frame)) + frame)
+
+with st.sidebar:
+    st.header("Link Control")
+    if not st.session_state.connected:
+        if st.button("🚀 Connect to Spacecraft", use_container_width=True):
+            with st.spinner("ML-KEM-768 handshake..."):
+                if connect():
+                    st.success("Quantum-safe link established")
+                    st.rerun()
+    else:
+        st.success("🟢 LINK LIVE (ML-KEM-768)")
+        if st.button("Disconnect", use_container_width=True):
+            try:
+                st.session_state.sock.close()
+            except Exception:
+                pass
+            st.session_state.connected = False
             st.rerun()
-        else:
-            st.sidebar.error(f"Connection Failed: Ensure satellite.py is running! ({info_str})")
-else:
-    st.sidebar.success("🟢 ML-KEM-768 LINK ACTIVE")
-    st.sidebar.info(f"Engine: {KEM_ALG}")
-    st.sidebar.text("Public Key: 1184 Bytes")
-    st.sidebar.text("Data Cipher: AES-256-GCM")
-    if st.sidebar.button("Disconnect Link"):
-        st.session_state.sock.close()
-        st.session_state.connected = False
-        st.rerun()
 
-# ─── METRICS BAR ───
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    st.metric("Spacecraft Health", "NOMINAL" if st.session_state.connected else "OFFLINE")
-with m2:
-    st.metric("Post-Quantum Key Exch", KEM_ALG, "NIST FIPS 203")
-with m3:
-    st.metric("Payload Cipher", "AES-256-GCM", "Active")
-with m4:
-    st.metric("Link Connection", "ONLINE" if st.session_state.connected else "DISCONNECTED")
+    st.divider()
+    st.subheader("Telecommands")
+    if st.session_state.connected:
+        if st.button("PING", use_container_width=True):
+            send_cmd({"cmd": "PING", "ts": time.time()})
+        mode = st.selectbox("Mode", ["NOMINAL", "SAFE", "SCIENCE", "DEORBIT_PREP"])
+        if st.button("SET MODE", use_container_width=True):
+            send_cmd({"cmd": "SET_MODE", "value": mode})
 
-st.markdown("---")
+if not st.session_state.connected:
+    st.info("Click **Connect to Spacecraft** in the sidebar. Make sure `satellite.py` is running.")
+    st.stop()
 
-# ─── MAIN DASHBOARD ───
-col_telemetry, col_controls = st.columns([2, 1])
+tlm = recv_one_tlm()
+if tlm:
+    st.session_state.tlm_log.append(tlm)
+    if len(st.session_state.tlm_log) > 120:
+        st.session_state.tlm_log = st.session_state.tlm_log[-120:]
 
-with col_telemetry:
-    st.subheader("📊 Live Encrypted Telemetry Feed")
-    
-    if st.button("📡 Fetch Real Encrypted Telemetry Frame") and st.session_state.connected:
-        raw_resp = send_real_command("CMD:GET_TELEMETRY")
-        if raw_resp and raw_resp.startswith("TEL:"):
-            json_data = json.loads(raw_resp[4:])
-            now = time.strftime("%H:%M:%S")
-            new_entry = {
-                "Time": [now],
-                "Temp": [json_data.get("temp_c", 22.0)],
-                "Voltage": [json_data.get("battery_v", 3.3)]
-            }
-            st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame(new_entry)]).tail(15)
-            st.success(f"Decrypted Raw Payload: {raw_resp[4:]}")
-    
-    # Plot Chart
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=st.session_state.history["Time"], y=st.session_state.history["Temp"], name="Temperature (°C)", line=dict(color="#FF4B4B", width=3)))
-    fig.add_trace(go.Scatter(x=st.session_state.history["Time"], y=st.session_state.history["Voltage"], name="Bus Voltage (V)", line=dict(color="#00D26A", width=3)))
-    fig.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=20, b=10))
-    st.plotly_chart(fig, width="stretch")
+if not st.session_state.tlm_log:
+    st.warning("Waiting for first CCSDS telemetry frame...")
+    time.sleep(0.5)
+    st.rerun()
 
-with col_controls:
-    st.subheader("⚡ Ground Station Commands")
-    
-    cmd_choice = st.selectbox("Select Payload:", ["CMD:GET_TELEMETRY", "CMD:GET_STATUS", "CMD:PING"])
-    
-    if st.button("🚀 Transmit Encrypted Payload"):
-        if st.session_state.connected:
-            with st.spinner("Encrypting with ML-KEM-768 derived key..."):
-                decrypted_response = send_real_command(cmd_choice)
-                time.sleep(0.2)
-                st.code(f"RESPONSE FROM SATELLITE:\n{decrypted_response}", language="json")
-        else:
-            st.error("Connect to satellite first using the sidebar button!")
+latest = st.session_state.tlm_log[-1]
+df = pd.DataFrame(st.session_state.tlm_log)
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Altitude", f"{latest.get('altitude_km', 0):.2f} km")
+c2.metric("Velocity", f"{latest.get('velocity_kms', 0):.3f} km/s")
+c3.metric("Battery", f"{latest.get('battery_v', 0):.2f} V")
+c4.metric("Solar Power", f"{latest.get('solar_power_w', 0):.1f} W")
+c5.metric("Temp", f"{latest.get('battery_temp_c', 0):.1f} °C")
+eclipse = latest.get("in_eclipse", False)
+c6.metric("Orbit Phase", "🌑 ECLIPSE" if eclipse else "☀️ SUNLIGHT")
+
+st.divider()
+
+fig = make_subplots(
+    rows=2,
+    cols=2,
+    subplot_titles=("Altitude (km)", "Battery Voltage (V)", "Solar Power (W)", "Doppler Shift (Hz)"),
+    vertical_spacing=0.12,
+)
+fig.add_trace(go.Scatter(y=df["altitude_km"], name="Alt", line=dict(color="#38bdf8")), row=1, col=1)
+fig.add_trace(go.Scatter(y=df["battery_v"], name="Batt", line=dict(color="#4ade80")), row=1, col=2)
+fig.add_trace(go.Scatter(y=df["solar_power_w"], name="Solar", line=dict(color="#facc15")), row=2, col=1)
+if "doppler_hz" in df.columns:
+    fig.add_trace(go.Scatter(y=df["doppler_hz"], name="Doppler", line=dict(color="#f472b6")), row=2, col=2)
+
+fig.update_layout(
+    height=520,
+    paper_bgcolor="#0b0f19",
+    plot_bgcolor="#111827",
+    font_color="#e0e6ed",
+    showlegend=False,
+    margin=dict(l=20, r=20, t=40, b=20),
+)
+fig.update_xaxes(showgrid=True, gridcolor="#1f2937")
+fig.update_yaxes(showgrid=True, gridcolor="#1f2937")
+st.plotly_chart(fig, use_container_width=True)
+
+with st.expander("Latest CCSDS Frame + Decrypted Telemetry", expanded=False):
+    st.json(latest)
+
+st.caption(
+    f"CCSDS seq={latest.get('_ccsds_seq', latest.get('ccsds_seq', '?'))}  |  "
+    f"APID={latest.get('_ccsds_apid', 0x100)}  |  Crypto=ML-KEM-768+AES-256-GCM  |  "
+    f"Frames logged={len(st.session_state.tlm_log)}"
+)
+
+time.sleep(0.8)
+st.rerun()
