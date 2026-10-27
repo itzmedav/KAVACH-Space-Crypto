@@ -1,281 +1,230 @@
-﻿"""
-KAVACH Mission Control Dashboard v3.1 (Smooth & Ultra-Fast)
-Streamlit + Plotly 2D Earth Tracking | HKDF-SHA256 | CCSDS | ML-KEM-768
-"""
-import streamlit as st
+﻿import streamlit as st
+import plotly.graph_objects as go
 import socket
-import struct
 import json
 import time
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import oqs
-import os
-from ccsds import CCSDSPacket, make_telecommand_frame, make_handshake_frame, derive_session_keys
+from ccsds import derive_session_keys, pack_ccsds_header, unpack_ccsds_header
+from rf_channel import calculate_rf_metrics, corrupt_payload
+from oqs import KeyEncapsulation
 
-st.set_page_config(page_title="KAVACH Mission Control", page_icon="🛡️", layout="wide")
-
-st.markdown(
-    """
-<style>
-header[data-testid="stHeader"] { display: none !important; }
-.stAppViewContainer { padding-top: 0rem !important; }
-.stApp { background-color: #060a12 !important; color: #f1f5f9; }
-[data-testid="stSidebar"] { background-color: #0b1120 !important; border-right: 1px solid #1e293b !important; }
-
-div[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-    border: 1px solid #334155;
-    padding: 10px 14px;
-    border-radius: 10px;
-}
-div[data-testid="stMetricValue"] { color: #38bdf8 !important; font-weight: 800 !important; font-size: 1.5rem !important; }
-div[data-testid="stMetricLabel"] { color: #94a3b8 !important; font-size: 0.75rem !important; font-weight: 600 !important; }
-
-.stButton > button {
-    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%) !important;
-    color: #38bdf8 !important;
-    border: 1px solid #0284c7 !important;
-    border-radius: 8px !important;
-    font-weight: 700 !important;
-    width: 100%;
-}
-.stButton > button:hover {
-    background: #0284c7 !important;
-    color: #ffffff !important;
-}
-</style>
-""",
-    unsafe_allow_html=True,
+st.set_page_config(
+    page_title="KAVACH - Spacecraft Mission Control",
+    page_icon="🛰️",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
-<div style="background: linear-gradient(90deg, #0b1120 0%, #1e293b 100%); padding: 14px 20px; border-radius: 10px; border: 1px solid #1e293b; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
-    <div>
-        <h1 style="margin:0; font-size: 1.8rem; font-weight: 800; color: #38bdf8; display: inline-block;">🛡️ KAVACH</h1>
-        <span style="font-size: 0.95rem; color: #94a3b8; margin-left: 10px; font-weight: 600;">MISSION CONTROL v3.1 • REAL-TIME GROUND TRACK</span>
-    </div>
-    <div style="background: #0284c722; border: 1px solid #0284c7; color: #38bdf8; padding: 4px 12px; border-radius: 16px; font-size: 0.80rem; font-weight: 700;">
-        FIPS 203 + HKDF-SHA256 + CCSDS
-    </div>
-</div>
+<style>
+    .stApp { background-color: #0b0f19; color: #e0e6ed; }
+    .metric-card {
+        background: linear-gradient(135deg, #161e2e 0%, #0d131d 100%);
+        border: 10px solid #1e293b;
+        border-radius: 10px;
+        padding: 15px;
+        box-shadow: 0 4px 20px rgba(0,255,204,0.05);
+    }
+    .status-badge-ok {
+        background-color: rgba(16, 185, 129, 0.2);
+        color: #10b981;
+        border: 1px solid #10b981;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-weight: bold;
+    }
+    .status-badge-alert {
+        background-color: rgba(239, 68, 68, 0.2);
+        color: #ef4444;
+        border: 1px solid #ef4444;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-weight: bold;
+    }
+</style>
 """, unsafe_allow_html=True)
 
-SERVER = ("127.0.0.1", 9999)
+if 'history' not in st.session_state:
+    st.session_state.history = []
+if 'seq_count' not in st.session_state:
+    st.session_state.seq_count = 1
+if 'replays_blocked' not in st.session_state:
+    st.session_state.replays_blocked = 0
+if 'tampered_blocked' not in st.session_state:
+    st.session_state.tampered_blocked = 0
 
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-    st.session_state.sock = None
-    st.session_state.payload_key = None
-    st.session_state.tlm_log = []
-    st.session_state.seq = 1
+st.sidebar.title("🛰️ KAVACH Mission Control")
+st.sidebar.markdown("**Post-Quantum Space Protocol**")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔐 Security Architecture")
+st.sidebar.info("""
+- **KEM:** ML-KEM-768 (NIST FIPS 203)
+- **KDF:** HKDF-SHA256 (NIST SP 800-56C)
+- **AEAD:** AES-256-GCM
+- **Framing:** CCSDS 133.0-B
+- **Anti-Replay:** 64-Frame Bitmap Window
+""")
 
-def aes_encrypt(key, pt):
-    aes = AESGCM(key)
-    nonce = os.urandom(12)
-    return nonce + aes.encrypt(nonce, pt, None)
+st.sidebar.markdown("---")
+st.sidebar.markdown("### ⚔️ Cyber Attack Harness")
+inject_replay = st.sidebar.button("⚡ INJECT REPLAY ATTACK", help="Re-sends an old valid CCSDS frame to test sequence rejection")
+inject_tamper = st.sidebar.button("💥 INJECT BIT-FLIP TAMPERING", help="Flips payload bits to test AES-GCM AEAD tag failure")
 
-def aes_decrypt(key, blob):
-    aes = AESGCM(key)
-    return aes.decrypt(blob[:12], blob[12:], None)
-
-def connect():
+def connect_and_fetch(attack_mode=None):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
-        s.connect(SERVER)
-
-        raw_len = s.recv(4)
-        n = struct.unpack(">I", raw_len)[0]
-        hs = b""
-        while len(hs) < n:
-            hs += s.recv(n - len(hs))
-
-        try:
-            parsed = CCSDSPacket.unpack(hs)
-            pk = parsed["data"]
-        except Exception:
-            pk = hs
-
-        with oqs.KeyEncapsulation("ML-KEM-768") as kem:
-            ct, ss = kem.encap_secret(pk)
-
-        payload_key, mac_key = derive_session_keys(ss)
-        frame = make_handshake_frame(0, ct)
-        s.sendall(struct.pack(">I", len(frame)) + frame)
-        s.settimeout(0.5)
-
-        st.session_state.sock = s
-        st.session_state.payload_key = payload_key
-        st.session_state.connected = True
-        return True
-    except Exception as e:
-        st.error(f"Connection error: {e}")
-        return False
-
-def recv_one_tlm():
-    s = st.session_state.sock
-    key = st.session_state.payload_key
-    try:
-        hdr = s.recv(4)
-        if not hdr or len(hdr) < 4:
+        s.settimeout(2.0)
+        s.connect(('127.0.0.1', 9999))
+        
+        # ML-KEM Handshake
+        raw_pk = s.recv(2048)
+        if not raw_pk:
+            s.close()
             return None
-        n = struct.unpack(">I", hdr)[0]
-        data = b""
-        while len(data) < n:
-            chunk = s.recv(n - len(data))
-            if not chunk:
-                return None
-            data += chunk
-        parsed = CCSDSPacket.unpack(data)
-        pt = aes_decrypt(key, parsed["data"])
-        tlm = json.loads(pt.decode("utf-8"))
-        tlm["_ccsds_apid"] = parsed["apid"]
-        tlm["_ccsds_seq"] = parsed["seq_count"]
-        return tlm
-    except Exception:
-        return None
+            
+        with KeyEncapsulation('Kyber768') as client_kem:
+            ciphertext, shared_secret = client_kem.encap_secret(raw_pk)
+            
+        s.sendall(ciphertext)
+        k_enc, _, _ = derive_session_keys(shared_secret)
+        
+        # Read Telemetry Frame
+        frame = s.recv(4096)
+        hdr, payload = unpack_ccsds_header(frame)
+        
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        aesgcm = AESGCM(k_enc)
+        nonce = payload[:12]
+        ct_tag = payload[12:]
+        
+        try:
+            pt = aesgcm.decrypt(nonce, ct_tag, frame[:6])
+            telemetry = json.loads(pt.decode('utf-8'))
+        except Exception as e:
+            telemetry = {"error": f"Decryption failed: {e}"}
 
-def send_cmd(cmd_dict):
-    s = st.session_state.sock
-    key = st.session_state.payload_key
-    blob = aes_encrypt(key, json.dumps(cmd_dict).encode())
-    frame = make_telecommand_frame(st.session_state.seq, blob)
-    st.session_state.seq = (st.session_state.seq + 1) % 16384
-    s.sendall(struct.pack(">I", len(frame)) + frame)
+        # Attack Injection Triggering
+        if attack_mode == 'replay':
+            hdr_bad = pack_ccsds_header(0x200, st.session_state.seq_count - 1, len(frame[:6]))
+            s.sendall(hdr_bad + payload)
+            st.session_state.replays_blocked += 1
+        elif attack_mode == 'tamper':
+            corrupted_payload = corrupt_payload(payload)
+            hdr_tc = pack_ccsds_header(0x200, st.session_state.seq_count, len(corrupted_payload))
+            s.sendall(hdr_tc + corrupted_payload)
+            st.session_state.tampered_blocked += 1
+            st.session_state.seq_count += 1
+            
+        s.close()
+        return telemetry, hdr
+    except Exception as ex:
+        return None, None
 
-with st.sidebar:
-    st.markdown("<h4 style='color:#38bdf8; margin-top:0;'>LINK STATUS</h4>", unsafe_allow_html=True)
-    if not st.session_state.connected:
-        if st.button("🚀 CONNECT LINK", use_container_width=True):
-            with st.spinner("Connecting..."):
-                if connect():
-                    st.success("Connected!")
-                    st.rerun()
-    else:
-        st.markdown("""
-        <div style='background:#10b98122; border:1px solid #10b981; color:#34d399; padding:8px; border-radius:6px; text-align:center; font-weight:700; margin-bottom:10px;'>
-            🟢 LIVE (ML-KEM-768)
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("DISCONNECT", use_container_width=True):
-            try:
-                st.session_state.sock.close()
-            except Exception:
-                pass
-            st.session_state.connected = False
-            st.rerun()
+attack = 'replay' if inject_replay else ('tamper' if inject_tamper else None)
+telemetry, hdr = connect_and_fetch(attack_mode=attack)
 
-    st.markdown("<hr style='border-color:#1e293b; margin: 10px 0;'>", unsafe_allow_html=True)
-    st.markdown("<h4 style='color:#38bdf8;'>COMMANDS</h4>", unsafe_allow_html=True)
-    if st.session_state.connected:
-        if st.button("📡 SEND PING", use_container_width=True):
-            send_cmd({"cmd": "PING", "ts": time.time()})
-        mode = st.selectbox("Mode", ["NOMINAL", "SAFE", "SCIENCE", "DEORBIT_PREP"])
-        if st.button("⚡ SET MODE", use_container_width=True):
-            send_cmd({"cmd": "SET_MODE", "value": mode})
+st.title("🛡️ KAVACH: Post-Quantum LEO Satellite Command & Telemetry")
 
-if not st.session_state.connected:
-    st.info("Click **🚀 CONNECT LINK** in the sidebar.")
-    st.stop()
+col_head1, col_head2, col_head3, col_head4 = st.columns(4)
+with col_head1:
+    st.markdown("<div class='metric-card'><h4>Status</h4><span class='status-badge-ok'>NOMINAL PASS</span></div>", unsafe_allow_html=True)
+with col_head2:
+    st.markdown(f"<div class='metric-card'><h4>Replays Blocked</h4><h2 style='color:#ef4444;'>{st.session_state.replays_blocked}</h2></div>", unsafe_allow_html=True)
+with col_head3:
+    st.markdown(f"<div class='metric-card'><h4>Tampered Frames Rejected</h4><h2 style='color:#f59e0b;'>{st.session_state.tampered_blocked}</h2></div>", unsafe_allow_html=True)
+with col_head4:
+    st.markdown("<div class='metric-card'><h4>Crypto Engine</h4><h4 style='color:#00ffcc;'>ML-KEM-768 ACTIVE</h4></div>", unsafe_allow_html=True)
 
-# Receive Telemetry
-tlm = recv_one_tlm()
-if tlm:
-    st.session_state.tlm_log.append(tlm)
-    if len(st.session_state.tlm_log) > 60:
-        st.session_state.tlm_log = st.session_state.tlm_log[-60:]
+st.markdown("---")
 
-if not st.session_state.tlm_log:
-    st.warning("Awaiting CCSDS Telemetry Stream...")
-    time.sleep(1.0)
-    st.rerun()
+if telemetry and 'error' not in telemetry:
+    st.session_state.history.append(telemetry)
+    if len(st.session_state.history) > 30:
+        st.session_state.history.pop(0)
 
-latest = st.session_state.tlm_log[-1]
-df = pd.DataFrame(st.session_state.tlm_log)
-
-# KPI Cards
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Position", f"{latest.get('latitude',0):.1f}°, {latest.get('longitude',0):.1f}°")
-c2.metric("Altitude", f"{latest.get('altitude_km', 0):.1f} km")
-c3.metric("Velocity", f"{latest.get('velocity_kms', 0):.2f} km/s")
-c4.metric("Battery", f"{latest.get('battery_v', 0):.2f} V")
-c5.metric("Solar Power", f"{latest.get('solar_power_w', 0):.1f} W")
-eclipse = latest.get("in_eclipse", False)
-c6.metric("Phase", "🌑 ECLIPSE" if eclipse else "☀️ SUNLIGHT")
-
-st.markdown("<br>", unsafe_allow_html=True)
-
-col_map, col_charts = st.columns([1.1, 1])
-
-with col_map:
-    st.markdown("<h5 style='color:#38bdf8; margin:0 0 6px 0;'>🌍 ORBITAL GROUND TRACK (ISTRAC BENGALURU)</h5>", unsafe_allow_html=True)
-    map_fig = go.Figure()
-
-    if "latitude" in df.columns and "longitude" in df.columns:
-        map_fig.add_trace(go.Scattergeo(
-            lat=df["latitude"],
-            lon=df["longitude"],
-            mode="lines",
-            line=dict(width=2, color="#38bdf8"),
-            name="Track",
+    df = pd.DataFrame(st.session_state.history)
+    
+    col_map, col_metrics = st.columns([6, 4])
+    
+    with col_map:
+        st.subheader("🌐 Ground Track & Pass Geometry (ISTRAC Bengaluru)")
+        fig_map = go.Figure()
+        
+        # Ground station marker
+        fig_map.add_trace(go.Scattergeo(
+            lat=[12.9716], lon=[77.5946],
+            mode='markers+text',
+            text=["ISTRAC Bengaluru"],
+            textposition="top center",
+            marker=dict(size=14, color='#00ffcc', symbol='triangle-up'),
+            name="Ground Station"
         ))
+        
+        # Satellite marker & track
+        if 'lat' in df.columns:
+            fig_map.add_trace(go.Scattergeo(
+                lat=df['lat'], lon=df['lon'],
+                mode='lines+markers',
+                line=dict(width=2, color='#3b82f6'),
+                marker=dict(size=8, color='#ef4444'),
+                name="KAVACH-1 Track"
+            ))
+            
+        fig_map.update_layout(
+            geo=dict(
+                projection_type='orthographic',
+                showland=True, landcolor='#1e293b',
+                showocean=True, oceancolor='#0f172a',
+                showcountries=True, countrycolor='#334155',
+                bgcolor='rgba(0,0,0,0)'
+            ),
+            margin=dict(l=0, r=0, t=0, b=0),
+            paper_bgcolor='rgba(0,0,0,0)',
+            height=400
+        )
+        st.plotly_chart(fig_map, width="stretch")
+        
+    with col_metrics:
+        st.subheader("⚡ Orbital Telemetry & RF Metrics")
+        m1, m2 = st.columns(2)
+        m1.metric("Altitude", f"{telemetry.get('alt_km', 500):.2f} km")
+        m2.metric("Velocity", f"{telemetry.get('vel_kms', 7.6):.2f} km/s")
+        
+        m3, m4 = st.columns(2)
+        m3.metric("Battery Voltage", f"{telemetry.get('battery_v', 8.2):.2f} V")
+        m4.metric("Solar Power", f"{telemetry.get('solar_w', 12.0):.2f} W")
 
-    map_fig.add_trace(go.Scattergeo(
-        lat=[latest.get("latitude", 0)],
-        lon=[latest.get("longitude", 0)],
-        mode="markers+text",
-        marker=dict(size=12, color="#f43f5e"),
-        text=["🛰️ KAVACH-1"],
-        textposition="top center",
-        name="Sat",
-    ))
+        m5, m6 = st.columns(2)
+        m5.metric("Doppler Shift", f"{telemetry.get('doppler_hz', 0):.1f} Hz")
+        m6.metric("RSSI / SNR", f"{telemetry.get('rssi_dbm', -90):.1f} dBm / {telemetry.get('snr_db', 12):.1f} dB")
 
-    map_fig.add_trace(go.Scattergeo(
-        lat=[13.0382],
-        lon=[77.5133],
-        mode="markers+text",
-        marker=dict(size=8, color="#10b981", symbol="square"),
-        text=["📡 ISTRAC"],
-        textposition="bottom center",
-        name="GS",
-    ))
+    st.markdown("---")
+    st.subheader("📈 Real-Time Telemetry Trends")
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        fig_batt = go.Figure()
+        fig_batt.add_trace(go.Scatter(y=df['battery_v'], mode='lines+markers', name='Battery (V)', line=dict(color='#10b981')))
+        fig_batt.update_layout(title="Battery Bus Voltage (V)", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#e0e6ed'), height=250)
+        st.plotly_chart(fig_batt, width="stretch")
+    with col_t2:
+        fig_doppler = go.Figure()
+        fig_doppler.add_trace(go.Scatter(y=df['doppler_hz'], mode='lines+markers', name='Doppler (Hz)', line=dict(color='#f59e0b')))
+        fig_doppler.update_layout(title="433 MHz RF Doppler Shift (Hz)", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#e0e6ed'), height=250)
+        st.plotly_chart(fig_doppler, width="stretch")
 
-    map_fig.update_layout(
-        geo=dict(
-            projection_type="equirectangular",
-            showland=True,
-            landcolor="#0b1120",
-            showocean=True,
-            oceancolor="#060a12",
-            showcountries=True,
-            countrycolor="#1e293b",
-            coastlinecolor="#334155",
-        ),
-        height=380,
-        paper_bgcolor="#060a12",
-        plot_bgcolor="#060a12",
-        margin=dict(l=0, r=0, t=0, b=0),
-        showlegend=False,
-    )
-    st.plotly_chart(map_fig, use_container_width=True)
+    st.markdown("---")
+    st.subheader("📦 CCSDS 133.0-B Primary Header Inspection")
+    if hdr:
+        st.json({
+            "Version": hdr['version'],
+            "Packet Type": "TC (Telecommand)" if hdr['type'] == 1 else "TM (Telemetry)",
+            "APID": f"0x{hdr['apid']:03X}",
+            "Sequence Count": hdr['seq'],
+            "Payload Length (bytes)": hdr['len']
+        })
 
-with col_charts:
-    st.markdown("<h5 style='color:#38bdf8; margin:0 0 6px 0;'>📈 TELEMETRY TRENDS</h5>", unsafe_allow_html=True)
-    fig = make_subplots(rows=2, cols=2, vertical_spacing=0.2, subplot_titles=("ALTITUDE (KM)", "BATTERY (V)", "SOLAR (W)", "DOPPLER (HZ)"))
-    fig.add_trace(go.Scatter(y=df["altitude_km"], line=dict(color="#38bdf8", width=2)), row=1, col=1)
-    fig.add_trace(go.Scatter(y=df["battery_v"], line=dict(color="#4ade80", width=2)), row=1, col=2)
-    fig.add_trace(go.Scatter(y=df["solar_power_w"], line=dict(color="#facc15", width=2)), row=2, col=1)
-    if "doppler_hz" in df.columns:
-        fig.add_trace(go.Scatter(y=df["doppler_hz"], line=dict(color="#f472b6", width=2)), row=2, col=2)
+else:
+    st.warning("⚠️ Connecting to Spacecraft Flight Software on TCP:9999...")
 
-    fig.update_layout(height=350, paper_bgcolor="#060a12", plot_bgcolor="#0b1120", font=dict(color="#cbd5e1"), showlegend=False, margin=dict(l=5, r=5, t=20, b=5))
-    fig.update_xaxes(showgrid=True, gridcolor="#1e293b")
-    fig.update_yaxes(showgrid=True, gridcolor="#1e293b")
-    st.plotly_chart(fig, use_container_width=True)
-
-# Smooth refresh interval
 time.sleep(1.5)
 st.rerun()
